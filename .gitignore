@@ -1,0 +1,6 @@
+.agents/
+.claude/
+.pi/
+skills-lock.json
+__pycache__/
+*.pyc

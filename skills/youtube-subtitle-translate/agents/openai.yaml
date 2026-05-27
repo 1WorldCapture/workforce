@@ -1,0 +1,7 @@
+interface:
+  display_name: "YouTube Subtitle Translate"
+  short_description: "Translate and render YouTube subtitles"
+  brand_color: "#DC2626"
+  default_prompt: "Use $youtube-subtitle-translate to translate this YouTube video into Chinese subtitles."
+policy:
+  allow_implicit_invocation: true
