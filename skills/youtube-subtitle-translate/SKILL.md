@@ -1,329 +1,273 @@
 ---
 name: youtube-subtitle-translate
 description: >
-  Download YouTube videos, extract/proofread/translate subtitles, and render them onto video.
-  Use whenever the user asks to download a YouTube video with subtitles, translate video subtitles
-  to Chinese, add subtitles/burn subtitles to a video, or do ASR transcription on video audio.
-  Covers the full pipeline: video download → subtitle extraction → proofreading → translation →
-  SRT generation → subtitle rendering. Also use for "下载视频加字幕", "视频翻译字幕",
-  "把字幕烧录到视频中". For pure subtitle file creation without rendering (just SRT output),
-  this skill handles that too — stop before Phase 5.
+  Download YouTube videos, extract source subtitles or transcribe audio, proofread and translate
+  subtitles, generate clean SRT files, and package selectable subtitle tracks into MP4/MKV files.
+  Use when the user asks to download YouTube videos with subtitles, translate video subtitles,
+  extract or generate subtitle files, add selectable subtitles to a video, or process video
+  subtitles with ASR fallback.
 ---
 
 # YouTube Subtitle Translator
 
-Download YouTube videos, extract and process subtitles (proofread + punctuate + translate), then burn them back into the video. Handles both auto-generated captions and manual uploads, with fallback to ASR when no subtitles exist.
+Download a YouTube video, produce cleaned translated subtitles, and package the result as selectable subtitle tracks. Packaged subtitles are fast, reversible, selectable in the player, and do not require video re-encoding.
+
+## Defaults
+
+- Output directory: `~/Downloads/youtube-subtitle-translate/<sanitized video title>/`.
+- Source subtitle language: English when available; otherwise the video's original spoken language.
+- Target subtitle language: the system/user interface language by default. If the user names a target language, use the user's requested language.
+- Video quality: 1080p by default. If 1080p is unavailable, download the highest quality below 1080p.
+- Delivery: MP4 and MKV with selectable subtitle tracks.
+- Concurrency: at most 3 subtitle-processing subagents at a time.
 
 ## Hard Rules
 
-- Use at most **3 concurrent subagents** for subtitle chunk processing. When there are more than 3 chunks, run them in waves and launch the next chunk only after one subagent finishes.
-- Chunk count is not concurrency. You may split into 10 chunks, but you must not start 10 Codex processes/subagents at once; run at most 3 active workers at any time.
-- Always download only the source subtitle track: English when available, otherwise the video's original language. Do not download YouTube's auto-translated target-language captions; translate from the source subtitle instead.
-- Never use a YouTube-provided target-language caption track as a shortcut, even for long videos and even if `zh-Hans` or another target language is listed in `automatic_captions`.
-- Video download defaults to 1080p. If 1080p is unavailable, download the best available version below 1080p.
-- Translation must be performed by subagents over chunk files. Do not use local model helpers for translation.
-- Before writing SRT/ASS, strip illegal subtitle characters from text, especially stray backslashes (`\`) that render visibly in video.
+- Do not use YouTube-provided target-language or auto-translated captions. Download only the source subtitle track and translate it yourself.
+- If available tracks include both `en-orig` and `zh-Hans` or another target-language track, choose only `en-orig`.
+- Use current `yt-dlp`; stale builds often expose only 360p.
+- For HD downloads, select split video-only plus audio-only streams and let `yt-dlp` merge them.
+- Use subagents for translation chunks. Do not use local model helpers for translation.
+- Remove subtitle text characters that break subtitle/container behavior: stray backslashes, control characters, and raw `{` / `}` braces.
+- Normalize rolling or overlapping captions before producing final SRT files. Ordinary video players stack overlapping SRT entries.
+- Do not hard-code any target language. Use the system/user interface language by default, unless the user specified a target language.
 
-## Workflow Overview
+## Workflow
 
 ```
-Phase 1: Download    →  Get video info, download video, extract subtitles
-Phase 2: Prepare     →  If no subtitles: extract audio → run ASR
-Phase 3: Process     →  Split into chunks → parallel agent proofread + translate
-Phase 4: Merge       →  Combine chunks → generate SRT/ASS files
-Phase 5: Render      →  Burn subtitles onto video using ffmpeg
+Phase 1: Download    -> video + source subtitles
+Phase 2: Prepare     -> parse subtitles or run ASR fallback
+Phase 3: Process     -> chunk, proofread, translate
+Phase 4: Merge       -> sanitize, remove empty rows, fix overlaps, write SRTs
+Phase 5: Package     -> mux selectable subtitle tracks into MP4/MKV
+```
+
+## Prerequisites
+
+Ensure these tools are installed before running the workflow:
+
+- `yt-dlp` for YouTube download and subtitle extraction.
+- `ffmpeg` for merging downloaded video/audio streams, ASR audio extraction, and MP4/MKV subtitle packaging.
+- Python 3 for parsing, splitting, merging, and validating subtitle files.
+- Optional ASR tool such as `qwen3-asr` or a Whisper-compatible CLI when the video has no usable source subtitles.
+
+Before listing formats or downloading, ensure `yt-dlp` exists and is current:
+
+```bash
+bash scripts/ensure-yt-dlp.sh
 ```
 
 ## Phase 1: Download
 
-### 1.1 Get Video Info
-
-Use the YouTube MCP tool to fetch metadata:
-
-```
-youtube_get_video_info(videoId="...", detail="standard")
-```
-
-Record: title, duration, channel, whether subtitles are available.
-
-### 1.2 Create Output Directory
-
-Name the directory after the video title. Sanitize for filesystem:
+Create the output directory under Downloads:
 
 ```bash
-mkdir -p "/output/path/<Video Title>"
+mkdir -p "$HOME/Downloads/youtube-subtitle-translate/<Video Title>"
 ```
 
-### 1.3 Download Video
-
-```
-youtube_download(videoId="...", outputPath="<dir>/video.mp4", quality="1080p", force=true)
-```
-
-If using `yt-dlp`, prefer 1080p and fall back to the best format below 1080p:
+Inspect formats when quality is uncertain:
 
 ```bash
-yt-dlp -f "bv*[height<=1080]+ba/b[height<=1080]/best" --merge-output-format mp4 \
-  -o "<dir>/video.%(ext)s" "<url>"
+yt-dlp -F "<url>"
 ```
 
-### 1.4 Extract Source Subtitles Only
+If format listing does not show expected HD formats, rerun `scripts/ensure-yt-dlp.sh` and list formats again.
 
+Download 1080p video plus best audio. If 1080p is unavailable, this format expression falls back to the highest available video below 1080p:
+
+```bash
+yt-dlp \
+  -f "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/best" \
+  --merge-output-format mp4 \
+  -o "<dir>/video.%(ext)s" \
+  "<url>"
 ```
-youtube_get_transcript(videoId="...", language="<source-language>")
-```
 
-If the result exceeds token limits, it's saved to a tool-results file — read it in chunks.
-
-This is a non-negotiable source-subtitle policy:
-- Prefer English subtitles/captions when available.
-- If English is not available, use the video's original spoken language.
-- Ignore `zh-Hans`, `zh-Hant`, and every other target-language track shown by YouTube, including auto-translated tracks.
-- Do not request, retry, merge, or render a YouTube-provided target-language caption track.
-- Target-language subtitles must be produced only by subagent translation from the source subtitle.
-
-If a tool returns a list such as `en-orig, zh-Hans`, choose only `en-orig`. Do not include `zh-Hans` in any download command.
-
-If using `yt-dlp`, write only the source subtitle:
+Download source subtitles only:
 
 ```bash
 yt-dlp --skip-download --write-auto-subs --write-subs \
-  --sub-langs "en.*" --sub-format srt --convert-subs srt \
+  --sub-langs "en-orig,en.*" --sub-format "srt/json3" --convert-subs srt \
   -o "<dir>/video.%(ext)s" "<url>"
 ```
 
-Wrong, do not run:
+If English is unavailable, replace `en-orig,en.*` with the video's original subtitle language code. Do not add the target language code to this command.
 
-```bash
-yt-dlp --write-auto-subs --sub-langs "en-orig,zh-Hans" ...
+Keep these files in the output directory:
+
+- `video.mp4`
+- `raw_segments.json`
+- `raw_subtitles.srt`
+- `chunk_XX.json`
+- `result_XX.json`
+- final SRT files
+- packaged MP4/MKV outputs
+
+## Phase 2: Prepare
+
+If source subtitles are available, parse them into segment JSON:
+
+```json
+{"text": "...", "offset": 12.3, "duration": 2.4}
 ```
 
-If the English/original subtitle download succeeds but a target-language request fails with HTTP 429, do not retry the target-language request. That request should not have been made; continue from the source subtitle and translate it through Phase 3.
+If no subtitles are available, extract audio and run ASR:
 
-**If subtitles exist**: Save raw segments as JSON, proceed to Phase 3.
-**If NO subtitles** (404/error): Proceed to Phase 2 (ASR fallback).
+```bash
+ffmpeg -i video.mp4 -vn -acodec pcm_s16le -ar 16000 -ac 1 audio.wav
+qwen3-asr audio.wav --output-format srt > raw_subtitles.srt
+```
 
-Save raw data:
-- `raw_segments.json` — all segments with text/offset/duration
-- `raw_subtitles.srt` — initial SRT conversion
+Then parse the ASR SRT into `raw_segments.json`.
 
-## Phase 2: ASR Fallback (No Subtitles Available)
+## Phase 3: Process
 
-When the video has no captions/transcripts:
-
-1. **Extract audio** from video using ffmpeg:
-   ```bash
-   ffmpeg -i video.mp4 -vn -acodec pcm_s16le -ar 16000 -ac 1 audio.wav
-   ```
-
-2. **Run ASR** — user specified qwen3-asr but any whisper-compatible model works:
-   ```bash
-   qwen3-asr audio.wav --output-format srt > raw_subtitles.srt
-   ```
-   Or use the built-in approach via hyperframes-media skill's transcribe command.
-
-3. Parse the SRT output back into the segment JSON format expected by Phase 3.
-
-## Phase 3: Parallel Proofreading & Translation
-
-This is the most time-consuming step for long videos. The strategy: split into chunks and process them with subagents, with a hard limit of 3 concurrent subagents.
-
-Do this phase even for very long videos. Length is not a reason to download or use YouTube's target-language auto-captions. The correct shortcut for long videos is chunking plus 3-way subagent concurrency, not target-caption reuse.
-
-### 3.1 Split Segments Into Chunks
-
-Use `scripts/merge-chunks.py`'s inverse logic — split `raw_segments.json` into N chunk files:
+Split `raw_segments.json` into chunk files:
 
 ```python
-# Split into chunks sized for review/translation.
 n = len(segments)
 chunk_count = min(10, max(1, (n + 75) // 76))
 chunk_size = n // chunk_count + 1
 for i in range(0, n, chunk_size):
-    save_chunk(i, segs[i:i+chunk_size])
+    save_chunk(i, segments[i:i + chunk_size])
 ```
 
-Save as `chunk_00.json`, `chunk_01.json`, etc. Each contains `{"chunk_id", "start_idx", "end_idx", "segments": [...]}`.
+Run at most 3 subagents concurrently. Each subagent receives:
 
-### 3.2 Launch Parallel Agents
+- Its `chunk_XX.json` path.
+- The target language. Default to the system language unless the user specified another language.
+- The proofreading/translation spec: `references/subtitle-proofreading.md`.
+- Output path: `result_XX.json`.
 
-For each chunk, spawn a background subagent. Launch no more than 3 subagents at the same time. If there are 10 chunks, start chunks `00`, `01`, and `02` first; when one finishes, start the next pending chunk. Never start all 10 chunks at once. Give each agent:
+Each result entry must contain:
 
-1. The path to its `chunk_XX.json`
-2. Instructions to read [references/subtitle-proofreading.md](references/subtitle-proofreading.md) for the full spec
-3. Output path: `result_XX.json` in the same directory
+```json
+{"index": 0, "start": 12.3, "end": 14.7, "en": "Proofread source text.", "zh": "Translated target text."}
+```
 
-The agent must:
-- Read every segment in its chunk
-- Proofread English (fix ASR errors, add punctuation)
-- Translate to natural Simplified Chinese (keep tech terms in English)
-- Save as JSON array with `{index, start, end, en, zh}` per segment
-- Remove illegal subtitle characters from `en` and `zh`, especially stray backslashes (`\`), control characters, and raw ASS override braces.
+Note: the `en` and `zh` field names are retained for current script compatibility. Treat `en` as source text and `zh` as translated target text, regardless of the actual source or target language.
 
-**Important**: Maximum concurrency is 3 subagents/processes. If there are more than 3 chunks, run them in waves. Do not launch 10 Codex child processes for 10 chunks.
+## Phase 4: Merge
 
-### 3.3 Wait for Completion
-
-Monitor which `result_XX.json` files appear. Don't proceed until all chunks complete.
-
-## Phase 4: Merge & Generate Output Files
-
-Run the merge script:
+Run:
 
 ```bash
 python3 scripts/merge-chunks.py <output_dir>
 ```
 
-This auto-discovers all `result_*.json` files and produces:
+The merge step must:
+
+- Sort by timestamp.
+- Save raw merged data as `final_subtitles_raw.json`.
+- Remove empty subtitle rows.
+- Sanitize visible text.
+- Fix abnormal durations.
+- Clamp each subtitle end time before the next subtitle begins.
+- Write final non-overlapping SRT files.
+
+Expected outputs:
 
 | File | Content |
 |------|---------|
-| `final_subtitles.json` | Merged JSON, sorted by timestamp |
-| `subtitles_bilingual.srt` | English + Chinese lines |
-| `subtitles_zh.srt` | Chinese only |
-| `subtitles_en.srt` | English only |
+| `final_subtitles_raw.json` | Raw merged subtitle data before cleanup |
+| `final_subtitles.json` | Cleaned non-overlapping subtitle data |
+| `subtitles_bilingual.srt` | Source + target language |
+| `subtitles_zh.srt` | Target language only, historical filename |
+| `subtitles_en.srt` | Source language only, historical filename |
 
-### 4.2 Validate Data Quality
-
-**Before rendering, always validate the merged data.** Parallel agent processing can produce timestamp corruption:
-
-```bash
-# Check for abnormal durations (>120s = almost certainly corrupted)
-python3 -c "
-import json
-segs = json.load(open('final_subtitles.json'))
-bad = [s for s in segs if s['end'] - s['start'] > 120]
-print(f'Abnormal durations: {len(bad)} / {len(segs)}')
-for s in bad: print(f'  [{s[\"index\"]}] {s[\"start\"]:.1f}->{s[\"end\"]:.1f} ({s[\"end\"]-s[\"start\"]:.0f}s)')
-"
-```
-
-If any are found, fix them (cap `end` at `start + 6`) and regenerate SRT/ASS. Both `merge-chunks.py` and `srt-to-ass.py` include auto-detection and auto-fix for this issue.
-
-Verify the output: check first and last few entries have correct timestamps and readable text.
-
-Also verify text sanitation:
+Validate before packaging:
 
 ```bash
 python3 -c "
 import json
 segs = json.load(open('final_subtitles.json'))
-bad = [s for s in segs if '\\\\' in s.get('en','') or '\\\\' in s.get('zh','')]
-print(f'Backslash artifacts: {len(bad)}')
-for s in bad[:10]: print(s['index'], s.get('en',''), s.get('zh',''))
+print('segments', len(segs))
+print('duration issues', sum(1 for s in segs if s['end'] <= s['start'] or s['end'] - s['start'] > 120))
+print('overlaps', sum(1 for a, b in zip(segs, segs[1:]) if a['end'] > b['start']))
+print('backslashes', sum(1 for s in segs if '\\\\' in s.get('en','') or '\\\\' in s.get('zh','')))
 "
 ```
 
-## Phase 5: Render Subtitles Onto Video
+All counts except `segments` should be `0`.
 
-This is where things get tricky. **Do NOT use the system ffmpeg directly** — see Pitfalls below.
+## Phase 5: Package
 
-### 5.1 Run the Render Script
+Package selectable subtitle tracks without re-encoding video or audio.
 
-```bash
-bash scripts/render-subtitles.sh <video.mp4> <subtitles_bilingual.srt> [output.mp4]
-```
-
-The script handles everything:
-- Detects/builds ARM64-native ffmpeg with libass support
-- Converts SRT → ASS with proper CJK font config
-- Copies files to /tmp to avoid special-character path issues
-- Renders with ffmpeg's ass filter
-- Validates the output
-
-### 5.2 Verify Output
-
-Check that:
-- Output file exists and is > 10MB (not just audio)
-- Duration matches original video (use ffprobe)
-- Play the first and last minute to confirm subtitles appear
-
-## Pitfalls & Lessons Learned
-
-These are hard-won lessons from real usage. Follow them to avoid wasting hours.
-
-### ffmpeg Architecture Mismatch (CRITICAL)
-
-**Problem**: macOS Homebrew's ffmpeg is compiled WITHOUT libass, libfreetype, and fontconfig. The `ass`, `subtitles`, and `drawtext` filters simply don't exist.
-
-**Worse**: Static ffmpeg builds from evermeet.cx are **x86_64 (Intel)** binaries. On Apple Silicon Macs they run through Rosetta 2 emulation at ~8-10x slower. A 1.5h video took 2+ hours.
-
-**Solution**: Use `scripts/ensure-ffmpeg.sh`. It detects these issues and compiles ARM64-native ffmpeg from source with all needed libraries. First build takes ~5 minutes; subsequent rebuilds are instant (cached object files).
-
-Required configure flags for full subtitle support:
-```
---enable-libass --enable-libfreetype --enable-fontconfig --enable-libdav1d
-```
-
-### AV1 Decode Missing
-
-**Problem**: Many modern YouTube videos are encoded in AV1 (`codec_name: av1`). A ffmpeg built without `--enable-libdav1d` will fail with "Function not implemented" errors during decode, producing a 68MB audio-only file.
-
-**Solution**: Always include `--enable-libdav1d` when building ffmpeg.
-
-### Path Special Characters Break ffmpeg Filters
-
-**Problem**: When the video or subtitle path contains characters like em-dashes (—), smart quotes, or non-ASCII characters, ffmpeg's filter parser chokes with "No option name near..." errors. This happens even with proper shell quoting.
-
-**Solution**: Copy subtitle files to `/tmp/subs_<pid>.ass` before passing to ffmpeg. The render script does this automatically.
-
-### moviepy TextClip API Conflicts (AVOID)
-
-**Problem**: moviepy 2.x's `TextClip` has parameter conflicts between positional args and kwargs (`font` appears twice internally). Multiple error variants, none obvious from the error message.
-
-**Recommendation**: Don't use moviepy for production subtitle rendering. Use ffmpeg's ass filter instead — it's faster, more reliable, and handles CJK fonts properly through libass/fontconfig.
-
-### SRT vs ASS for ffmpeg
-
-**Problem**: ffmpeg's `subtitles` filter (which reads SRT directly) also suffers from path-parsing issues on some builds. The `ass` filter is more reliable.
-
-**Solution**: Convert SRT → ASS first using `scripts/srt-to-ass.py`, then use the `ass` filter. The ASS format also gives you fine control over font, size, positioning, and styling.
-
-### Illegal Subtitle Characters
-
-**Problem**: Raw or translated subtitle text can contain stray backslashes (`\`) or ASS override characters. In ASS rendering, a literal backslash can appear on screen or accidentally interact with ASS escape syntax.
-
-**Solution**: Sanitize subtitle text before writing SRT/ASS:
-- Remove backslashes from user-visible subtitle text
-- Remove control characters except normal whitespace
-- Strip raw `{` and `}` braces from subtitle text
-- Let `srt-to-ass.py` add only the ASS control sequences it owns, such as `\N` between bilingual lines
-
-### Abnormal Subtitle Durations from Parallel Agent Processing
-
-**Problem**: When processing subtitles in parallel chunks (Phase 3), individual agents can produce entries with corrupted timestamps — specifically, `end` values that are far larger than `start` (e.g., duration of 2600s or 4800s instead of ~6s). This causes those subtitle lines to remain visible on screen for most of the video, overlapping with all other content.
-
-**Root cause**: Agents sometimes mis-assign end times when consolidating fragmented ASR segments across chunk boundaries. The issue is data-level, not a rendering problem — so it won't be caught by ffmpeg errors.
-
-**Solution**: Three layers of defense:
-1. **`scripts/srt-to-ass.py`** auto-detects entries with duration > 120s and caps them at 6s with a warning
-2. **Phase 4 validation**: After merging chunks, always scan for entries where `(end - start) > 120` seconds
-3. **Pre-render check**: Before running ffmpeg, grep the ASS file for suspiciously long Dialogue lines
+MP4 output:
 
 ```bash
-# Quick pre-render check: find any subtitle lasting > 2 minutes
-python3 -c "
-import json, sys
-segs = json.load(open('final_subtitles.json'))
-bad = [s for s in segs if s['end'] - s['start'] > 120]
-if bad: print(f'WARNING: {len(bad)} abnormal durations found!'); sys.exit(1)
-else: print('Duration check passed')
-"
+ffmpeg -y \
+  -i "<dir>/video.mp4" \
+  -i "<dir>/subtitles_bilingual.srt" \
+  -i "<dir>/subtitles_zh.srt" \
+  -i "<dir>/subtitles_en.srt" \
+  -map 0:v -map 0:a? -map 1:0 -map 2:0 -map 3:0 \
+  -c:v copy -c:a copy -c:s mov_text \
+  -metadata:s:s:0 language=und -metadata:s:s:0 title="Source + Target" \
+  -metadata:s:s:1 language=und -metadata:s:s:1 title="Target" \
+  -metadata:s:s:2 language=und -metadata:s:s:2 title="Source" \
+  -disposition:s:0 default -disposition:s:1 0 -disposition:s:2 0 \
+  "<dir>/video_with_selectable_subtitles.mp4"
 ```
 
-### Font Size Tuning
+MKV output:
 
-**Problem**: Default font sizes (16-20px) may be too small on high-resolution 1080p+ videos, especially when viewing on smaller screens or from a distance.
+```bash
+ffmpeg -y \
+  -i "<dir>/video.mp4" \
+  -i "<dir>/subtitles_bilingual.srt" \
+  -i "<dir>/subtitles_zh.srt" \
+  -i "<dir>/subtitles_en.srt" \
+  -map 0:v -map 0:a? -map 1:0 -map 2:0 -map 3:0 \
+  -c copy \
+  -metadata:s:s:0 language=und -metadata:s:s:0 title="Source + Target" \
+  -metadata:s:s:1 language=und -metadata:s:s:1 title="Target" \
+  -metadata:s:s:2 language=und -metadata:s:s:2 title="Source" \
+  -disposition:s:0 default -disposition:s:1 0 -disposition:s:2 0 \
+  "<dir>/video_with_selectable_subtitles.mkv"
+```
 
-**Solution**: Use `--font-size` flag to adjust. Recommended baseline sizes:
-- 1080p video: `--font-size 24` (bilingual) or `--font-size 28` (single language)
-- 4K video: `--font-size 36` or larger
-- The `render-subtitles.sh` script passes this through to `srt-to-ass.py`
+Generated files:
+
+| File | Notes |
+|------|-------|
+| `video_with_selectable_subtitles.mp4` | MP4 with `mov_text` subtitle tracks |
+| `video_with_selectable_subtitles.mkv` | MKV with native SRT subtitle tracks |
+
+Default track layout:
+
+1. Source + target language, default
+2. Target language only
+3. Source language only
+
+Verify tracks:
+
+```bash
+ffprobe -v error \
+  -show_entries stream=index,codec_type,codec_name:stream_tags=language,title:stream_disposition=default \
+  -of json "<dir>/video_with_selectable_subtitles.mkv"
+```
+
+Prefer MKV when track titles and original SRT fidelity matter. Prefer MP4 when Apple/QuickTime-style compatibility matters.
+
+## Known Issues
+
+### Rolling YouTube Captions
+
+YouTube auto captions are often rolling-window captions. Raw SRT entries can overlap heavily; this is normal on YouTube but wrong for normal players. Always use the cleaned SRT files from `merge-chunks.py`, not raw SRT files, for packaging.
+
+### yt-dlp Quality Listing
+
+If only 360p appears, run `scripts/ensure-yt-dlp.sh` and list formats again. Current YouTube extraction often needs the latest extractor and JS challenge support. HD formats commonly appear as video-only streams that must be merged with a separate audio-only stream.
+
+### Target Language
+
+Do not assume Chinese. Use the system language by default; use the user-requested language when specified. If the target language is ambiguous, infer it from the system/user interface language and the user's conversation language. Keep technical terms in English when that is natural for the target language or requested by the user.
 
 ## Dependencies
 
-- **YouTube MCP tools**: `mcp__plugin_youtube_youtube__*` (video download, transcript, info)
-- **ffmpeg**: Auto-built by `scripts/ensure-ffmpeg.sh` if system version insufficient
-- **Python 3**: For merge/convert scripts
-- **Homebrew**: For build dependencies (libass, freetype, dav1d, etc.)
-- **ASR tool** (optional): qwen3-asr, whisper, or any speech-to-text tool
+- `yt-dlp`
+- `ffmpeg`
+- Python 3
+- Optional ASR tool: `qwen3-asr`, Whisper-compatible CLI, or equivalent
