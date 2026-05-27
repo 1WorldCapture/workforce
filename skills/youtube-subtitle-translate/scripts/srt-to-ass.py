@@ -57,6 +57,16 @@ def detect_bilingual(entries: list[dict]) -> bool:
     return False
 
 
+def sanitize_text(value: str) -> str:
+    """Remove user-visible characters that conflict with ASS rendering."""
+    value = str(value or "")
+    value = value.replace("\\", "")
+    value = value.replace("{", "").replace("}", "")
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
+    value = re.sub(r"[ \t]+", " ", value)
+    return value.strip()
+
+
 def fmt_ass_time(seconds: float) -> str:
     """Format seconds to ASS timestamp H:MM:SS.cc"""
     h = int(seconds // 3600)
@@ -118,14 +128,13 @@ def generate_ass(entries: list[dict], is_bilingual: bool,
         text = entry["lines"]
 
         if is_bilingual and len(text) >= 2:
-            en_line = text[0].replace("\n", "")
-            zh_line = text[1].replace("\n", "")
+            en_line = sanitize_text(text[0].replace("\n", ""))
+            zh_line = sanitize_text(text[1].replace("\n", ""))
             combined = f"{en_line}\\N{zh_line}"
         else:
-            combined = "\\N".join(text).replace("\n", "\\N")
+            combined = "\\N".join(sanitize_text(line) for line in text).replace("\n", "\\N")
 
-        # Escape ASS special chars
-        combined = combined.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+        # User text is sanitized above. Keep ASS-owned separators such as \N intact.
 
         lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{combined}")
 

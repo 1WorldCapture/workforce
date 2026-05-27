@@ -18,6 +18,7 @@ Usage:
 
 import json
 import os
+import re
 import sys
 
 
@@ -49,6 +50,16 @@ def fmt_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def sanitize_text(value: str) -> str:
+    """Remove characters that render badly or conflict with ASS syntax."""
+    value = str(value or "")
+    value = value.replace("\\", "")
+    value = value.replace("{", "").replace("}", "")
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
+    value = re.sub(r"[ \t]+", " ", value)
+    return value.strip()
+
+
 def write_srt(segments: list[dict], path: str, mode: str = "bilingual"):
     """Write segments to SRT file.
 
@@ -61,12 +72,12 @@ def write_srt(segments: list[dict], path: str, mode: str = "bilingual"):
         lines.append(str(i))
         lines.append(f"{start} --> {end}")
         if mode == "bilingual":
-            lines.append(seg.get("en", ""))
-            lines.append(seg.get("zh", ""))
+            lines.append(sanitize_text(seg.get("en", "")))
+            lines.append(sanitize_text(seg.get("zh", "")))
         elif mode == "zh":
-            lines.append(seg.get("zh", seg.get("en", "")))
+            lines.append(sanitize_text(seg.get("zh", seg.get("en", ""))))
         else:
-            lines.append(seg.get("en", ""))
+            lines.append(sanitize_text(seg.get("en", "")))
         lines.append("")
 
     with open(path, "w", encoding="utf-8") as f:
@@ -114,6 +125,10 @@ def main():
             s["end"] = s["start"] + 6.0
         print(f"  Fixed all {len(bad)} entries (capped at 6s)", file=sys.stderr)
 
+    for s in segments:
+        s["en"] = sanitize_text(s.get("en", ""))
+        s["zh"] = sanitize_text(s.get("zh", ""))
+
     # Save merged JSON
     json_path = os.path.join(output_dir, "final_subtitles.json")
     with open(json_path, "w", encoding="utf-8") as f:
@@ -134,5 +149,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import re
     main()

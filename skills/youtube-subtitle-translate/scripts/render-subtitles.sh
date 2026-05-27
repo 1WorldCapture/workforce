@@ -12,7 +12,8 @@
 #   5. Validates output file
 #
 # Environment:
-#   SKILL_DIR  — root of the youtube-subtitle-translate skill (auto-detected)
+#   SKILL_DIR   — root of the youtube-subtitle-translate skill (auto-detected)
+#   FONT_SIZE   — base ASS font size before video scaling (default: 20)
 
 set -euo pipefail
 
@@ -53,12 +54,13 @@ cp "$SUBTITLES" "$TMP_SUBS"
 
 # --- Step 3: Convert SRT → ASS ---
 echo "=== Converting SRT → ASS ===" >&2
-python3 "$SKILL_DIR/scripts/srt-to-ass.py" "$TMP_SUBS" "$TMP_ASS"
+python3 "$SKILL_DIR/scripts/srt-to-ass.py" "$TMP_SUBS" "$TMP_ASS" --font-size "${FONT_SIZE:-20}"
 
 # --- Step 3.5: Pre-render validation (check for abnormal durations) ---
 echo "=== Validating subtitle data ===" >&2
 # Check ASS for Dialogue lines with suspiciously long duration (>120s)
-LONG_LINES=$(grep -c "Dialogue:.*[0-9]:[5-9][0-9]:[0-9][0-9]\.[0-9][0-9],[0-9]:[5-9][0-9]:[0-9][0-9]" "$TMP_ASS" 2>/dev/null || echo "0")
+LONG_LINES=$(grep -c "Dialogue:.*[0-9]:[5-9][0-9]:[0-9][0-9]\.[0-9][0-9],[0-9]:[5-9][0-9]:[0-9][0-9]" "$TMP_ASS" 2>/dev/null || true)
+LONG_LINES="${LONG_LINES:-0}"
 if [ "$LONG_LINES" -gt 0 ]; then
     echo "WARNING: Found $LONG_LINES subtitle entries with duration > ~10min." >&2
     echo "The srt-to-ass.py script should have auto-fixed these. Proceeding..." >&2
@@ -89,7 +91,7 @@ rm -f "$TMP_SUBS" "$TMP_ASS"
 # --- Step 5: Validate ---
 if [ -f "$OUTPUT" ]; then
     SIZE=$(du -h "$OUTPUT" | cut -f1)
-    DURATION=$("$FFMPEG_BIN" -i "$OUTPUT" 2>&1 | grep -oP 'Duration: \K[^\s,]+')
+    DURATION=$("$FFMPEG_BIN" -i "$OUTPUT" 2>&1 | sed -n 's/.*Duration: \([^,]*\),.*/\1/p' | head -1)
     echo "" >&2
     echo "=== Render complete! ===" >&2
     echo "  Output: $OUTPUT" >&2

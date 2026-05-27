@@ -34,13 +34,10 @@ check_ffmpeg() {
     [ "$arch" = "arm64" ] || return 1
 
     # Must have ass filter
-    "$bin" -filters 2>/dev/null | grep -q '\.\s*ass\s' || return 1
-
-    # Must have drawtext filter
-    "$bin" -filters 2>/dev/null | grep -q '\.\s*drawtext\s' || return 1
+    "$bin" -filters 2>/dev/null | grep -E '\.{3}[[:space:]]+ass[[:space:]]' >/dev/null || return 1
 
     # Must be able to decode AV1 (libdav1d)
-    "$bin" -decoders 2>/dev/null | grep -q 'libdav1d' || return 1
+    "$bin" -decoders 2>/dev/null | grep 'libdav1d' >/dev/null || return 1
 
     return 0
 }
@@ -76,7 +73,7 @@ if [ ${#missing_deps[@]} -gt 0 ]; then
 fi
 
 # Ensure libass, freetype, fontconfig, dav1d are installed via brew
-for pkg in libass freetype fontconfig dav1d libx264; do
+for pkg in libass freetype fontconfig dav1d x264; do
     if ! brew list "$pkg" &>/dev/null; then
         echo "Installing $pkg via brew..." >&2
         brew install "$pkg" >/dev/null 2>&1

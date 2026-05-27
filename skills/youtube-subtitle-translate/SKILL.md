@@ -14,6 +14,14 @@ description: >
 
 Download YouTube videos, extract and process subtitles (proofread + punctuate + translate), then burn them back into the video. Handles both auto-generated captions and manual uploads, with fallback to ASR when no subtitles exist.
 
+## Hard Rules
+
+- Use at most **3 concurrent subagents** for subtitle chunk processing. When there are more than 3 chunks, run them in waves and launch the next chunk only after one subagent finishes.
+- Always download only the source subtitle track: English when available, otherwise the video's original language. Do not download YouTube's auto-translated target-language captions; translate from the source subtitle instead.
+- Video download defaults to 1080p. If 1080p is unavailable, download the best available version below 1080p.
+- Translation must be performed by subagents over chunk files. Do not use local model helpers for translation.
+- Before writing SRT/ASS, strip illegal subtitle characters from text, especially stray backslashes (`\`) that render visibly in video.
+
 ## Workflow Overview
 
 ```
@@ -50,13 +58,33 @@ mkdir -p "/output/path/<Video Title>"
 youtube_download(videoId="...", outputPath="<dir>/video.mp4", quality="1080p", force=true)
 ```
 
-### 1.4 Extract Subtitles
+If using `yt-dlp`, prefer 1080p and fall back to the best format below 1080p:
+
+```bash
+yt-dlp -f "bv*[height<=1080]+ba/b[height<=1080]/best" --merge-output-format mp4 \
+  -o "<dir>/video.%(ext)s" "<url>"
+```
+
+### 1.4 Extract Source Subtitles Only
 
 ```
 youtube_get_transcript(videoId="...", format="both")
 ```
 
 If the result exceeds token limits, it's saved to a tool-results file — read it in chunks.
+
+Only fetch the source language subtitles:
+- Prefer English subtitles/captions when available.
+- If English is not available, use the video's original spoken language.
+- Do not request `zh-Hans`, `zh-Hant`, or any other translated caption track from YouTube. Target-language subtitles must be produced by translating the source subtitle.
+
+If using `yt-dlp`, write only the source subtitle:
+
+```bash
+yt-dlp --skip-download --write-auto-subs --write-subs \
+  --sub-langs "en.*" --sub-format srt --convert-subs srt \
+  -o "<dir>/video.%(ext)s" "<url>"
+```
 
 **If subtitles exist**: Save raw segments as JSON, proceed to Phase 3.
 **If NO subtitles** (404/error): Proceed to Phase 2 (ASR fallback).
@@ -84,16 +112,17 @@ When the video has no captions/transcripts:
 
 ## Phase 3: Parallel Proofreading & Translation
 
-This is the most time-consuming step for long videos. The strategy: split into ~10 chunks, process each with an independent agent in parallel.
+This is the most time-consuming step for long videos. The strategy: split into chunks and process them with subagents, with a hard limit of 3 concurrent subagents.
 
 ### 3.1 Split Segments Into Chunks
 
 Use `scripts/merge-chunks.py`'s inverse logic — split `raw_segments.json` into N chunk files:
 
 ```python
-# Split into ~10 chunks of ~290 segments each
+# Split into chunks sized for review/translation.
 n = len(segments)
-chunk_size = n // 10 + 1
+chunk_count = min(10, max(1, (n + 75) // 76))
+chunk_size = n // chunk_count + 1
 for i in range(0, n, chunk_size):
     save_chunk(i, segs[i:i+chunk_size])
 ```
@@ -102,7 +131,7 @@ Save as `chunk_00.json`, `chunk_01.json`, etc. Each contains `{"chunk_id", "star
 
 ### 3.2 Launch Parallel Agents
 
-For each chunk, spawn a background agent with subagent_type=`general-purpose`. Give each agent:
+For each chunk, spawn a background subagent. Launch no more than 3 subagents at the same time. Give each agent:
 
 1. The path to its `chunk_XX.json`
 2. Instructions to read [references/subtitle-proofreading.md](references/subtitle-proofreading.md) for the full spec
@@ -113,8 +142,9 @@ The agent must:
 - Proofread English (fix ASR errors, add punctuation)
 - Translate to natural Simplified Chinese (keep tech terms in English)
 - Save as JSON array with `{index, start, end, en, zh}` per segment
+- Remove illegal subtitle characters from `en` and `zh`, especially stray backslashes (`\`), control characters, and raw ASS override braces.
 
-**Important**: Launch ALL agents in the same turn (parallel Agent calls). Waiting sequentially would take 10x longer.
+**Important**: Maximum concurrency is 3 subagents. If there are more than 3 chunks, run them in waves.
 
 ### 3.3 Wait for Completion
 
@@ -155,6 +185,18 @@ for s in bad: print(f'  [{s[\"index\"]}] {s[\"start\"]:.1f}->{s[\"end\"]:.1f} ({
 If any are found, fix them (cap `end` at `start + 6`) and regenerate SRT/ASS. Both `merge-chunks.py` and `srt-to-ass.py` include auto-detection and auto-fix for this issue.
 
 Verify the output: check first and last few entries have correct timestamps and readable text.
+
+Also verify text sanitation:
+
+```bash
+python3 -c "
+import json
+segs = json.load(open('final_subtitles.json'))
+bad = [s for s in segs if '\\\\' in s.get('en','') or '\\\\' in s.get('zh','')]
+print(f'Backslash artifacts: {len(bad)}')
+for s in bad[:10]: print(s['index'], s.get('en',''), s.get('zh',''))
+"
+```
 
 ## Phase 5: Render Subtitles Onto Video
 
@@ -220,6 +262,16 @@ Required configure flags for full subtitle support:
 **Problem**: ffmpeg's `subtitles` filter (which reads SRT directly) also suffers from path-parsing issues on some builds. The `ass` filter is more reliable.
 
 **Solution**: Convert SRT → ASS first using `scripts/srt-to-ass.py`, then use the `ass` filter. The ASS format also gives you fine control over font, size, positioning, and styling.
+
+### Illegal Subtitle Characters
+
+**Problem**: Raw or translated subtitle text can contain stray backslashes (`\`) or ASS override characters. In ASS rendering, a literal backslash can appear on screen or accidentally interact with ASS escape syntax.
+
+**Solution**: Sanitize subtitle text before writing SRT/ASS:
+- Remove backslashes from user-visible subtitle text
+- Remove control characters except normal whitespace
+- Strip raw `{` and `}` braces from subtitle text
+- Let `srt-to-ass.py` add only the ASS control sequences it owns, such as `\N` between bilingual lines
 
 ### Abnormal Subtitle Durations from Parallel Agent Processing
 
