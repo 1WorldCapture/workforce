@@ -17,7 +17,9 @@ Download YouTube videos, extract and process subtitles (proofread + punctuate + 
 ## Hard Rules
 
 - Use at most **3 concurrent subagents** for subtitle chunk processing. When there are more than 3 chunks, run them in waves and launch the next chunk only after one subagent finishes.
+- Chunk count is not concurrency. You may split into 10 chunks, but you must not start 10 Codex processes/subagents at once; run at most 3 active workers at any time.
 - Always download only the source subtitle track: English when available, otherwise the video's original language. Do not download YouTube's auto-translated target-language captions; translate from the source subtitle instead.
+- Never use a YouTube-provided target-language caption track as a shortcut, even for long videos and even if `zh-Hans` or another target language is listed in `automatic_captions`.
 - Video download defaults to 1080p. If 1080p is unavailable, download the best available version below 1080p.
 - Translation must be performed by subagents over chunk files. Do not use local model helpers for translation.
 - Before writing SRT/ASS, strip illegal subtitle characters from text, especially stray backslashes (`\`) that render visibly in video.
@@ -68,15 +70,19 @@ yt-dlp -f "bv*[height<=1080]+ba/b[height<=1080]/best" --merge-output-format mp4 
 ### 1.4 Extract Source Subtitles Only
 
 ```
-youtube_get_transcript(videoId="...", format="both")
+youtube_get_transcript(videoId="...", language="<source-language>")
 ```
 
 If the result exceeds token limits, it's saved to a tool-results file — read it in chunks.
 
-Only fetch the source language subtitles:
+This is a non-negotiable source-subtitle policy:
 - Prefer English subtitles/captions when available.
 - If English is not available, use the video's original spoken language.
-- Do not request `zh-Hans`, `zh-Hant`, or any other translated caption track from YouTube. Target-language subtitles must be produced by translating the source subtitle.
+- Ignore `zh-Hans`, `zh-Hant`, and every other target-language track shown by YouTube, including auto-translated tracks.
+- Do not request, retry, merge, or render a YouTube-provided target-language caption track.
+- Target-language subtitles must be produced only by subagent translation from the source subtitle.
+
+If a tool returns a list such as `en-orig, zh-Hans`, choose only `en-orig`. Do not include `zh-Hans` in any download command.
 
 If using `yt-dlp`, write only the source subtitle:
 
@@ -85,6 +91,14 @@ yt-dlp --skip-download --write-auto-subs --write-subs \
   --sub-langs "en.*" --sub-format srt --convert-subs srt \
   -o "<dir>/video.%(ext)s" "<url>"
 ```
+
+Wrong, do not run:
+
+```bash
+yt-dlp --write-auto-subs --sub-langs "en-orig,zh-Hans" ...
+```
+
+If the English/original subtitle download succeeds but a target-language request fails with HTTP 429, do not retry the target-language request. That request should not have been made; continue from the source subtitle and translate it through Phase 3.
 
 **If subtitles exist**: Save raw segments as JSON, proceed to Phase 3.
 **If NO subtitles** (404/error): Proceed to Phase 2 (ASR fallback).
@@ -114,6 +128,8 @@ When the video has no captions/transcripts:
 
 This is the most time-consuming step for long videos. The strategy: split into chunks and process them with subagents, with a hard limit of 3 concurrent subagents.
 
+Do this phase even for very long videos. Length is not a reason to download or use YouTube's target-language auto-captions. The correct shortcut for long videos is chunking plus 3-way subagent concurrency, not target-caption reuse.
+
 ### 3.1 Split Segments Into Chunks
 
 Use `scripts/merge-chunks.py`'s inverse logic — split `raw_segments.json` into N chunk files:
@@ -131,7 +147,7 @@ Save as `chunk_00.json`, `chunk_01.json`, etc. Each contains `{"chunk_id", "star
 
 ### 3.2 Launch Parallel Agents
 
-For each chunk, spawn a background subagent. Launch no more than 3 subagents at the same time. Give each agent:
+For each chunk, spawn a background subagent. Launch no more than 3 subagents at the same time. If there are 10 chunks, start chunks `00`, `01`, and `02` first; when one finishes, start the next pending chunk. Never start all 10 chunks at once. Give each agent:
 
 1. The path to its `chunk_XX.json`
 2. Instructions to read [references/subtitle-proofreading.md](references/subtitle-proofreading.md) for the full spec
@@ -144,7 +160,7 @@ The agent must:
 - Save as JSON array with `{index, start, end, en, zh}` per segment
 - Remove illegal subtitle characters from `en` and `zh`, especially stray backslashes (`\`), control characters, and raw ASS override braces.
 
-**Important**: Maximum concurrency is 3 subagents. If there are more than 3 chunks, run them in waves.
+**Important**: Maximum concurrency is 3 subagents/processes. If there are more than 3 chunks, run them in waves. Do not launch 10 Codex child processes for 10 chunks.
 
 ### 3.3 Wait for Completion
 
