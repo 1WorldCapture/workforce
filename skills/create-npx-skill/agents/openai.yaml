@@ -1,0 +1,7 @@
+interface:
+  display_name: "Create Npx Skill"
+  short_description: "Build npx-installable skills repos"
+  brand_color: "#2563EB"
+  default_prompt: "Use $create-npx-skill to create an npx-installable skills repository."
+policy:
+  allow_implicit_invocation: true
