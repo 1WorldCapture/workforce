@@ -18,7 +18,7 @@ Download a YouTube video, produce cleaned translated subtitles, and package the 
 - Source subtitle language: English when available; otherwise the video's original spoken language.
 - Target subtitle language: the system/user interface language by default. If the user names a target language, use the user's requested language.
 - Video quality: 1080p by default. If 1080p is unavailable, download the highest quality below 1080p.
-- Delivery: MP4 and MKV with selectable subtitle tracks.
+- Delivery: MP4 and MKV with separate selectable subtitle tracks. The target-language track is default; the source-language track is optional.
 - Concurrency: at most 3 subtitle-processing subagents at a time.
 
 ## Hard Rules
@@ -171,7 +171,7 @@ Expected outputs:
 |------|---------|
 | `final_subtitles_raw.json` | Raw merged subtitle data before cleanup |
 | `final_subtitles.json` | Cleaned non-overlapping subtitle data |
-| `subtitles_bilingual.srt` | Source + target language |
+| `subtitles_bilingual.srt` | Source + target language, external reference file only |
 | `subtitles_zh.srt` | Target language only, historical filename |
 | `subtitles_en.srt` | Source language only, historical filename |
 
@@ -192,39 +192,48 @@ All counts except `segments` should be `0`.
 
 ## Phase 5: Package
 
-Package selectable subtitle tracks without re-encoding video or audio.
+Package separate selectable subtitle tracks without re-encoding video or audio.
+
+Do not mux `subtitles_bilingual.srt` by default. It contains both source and target text in the same subtitle event, so ordinary players render both lines together when that track is selected. Keep it as an external reference file unless the user explicitly asks for a bilingual display track.
+
+Use real language tags for the muxed tracks instead of `und`. Set:
+
+- `TARGET_LANG_CODE` to the target subtitle language code accepted by ffmpeg, such as `chi`/`zho` for Chinese, `jpn` for Japanese, or `spa` for Spanish.
+- `SOURCE_LANG_CODE` to the source subtitle language code, such as `eng` for English.
 
 MP4 output:
 
 ```bash
+TARGET_LANG_CODE=chi
+SOURCE_LANG_CODE=eng
+
 ffmpeg -y \
   -i "<dir>/video.mp4" \
-  -i "<dir>/subtitles_bilingual.srt" \
   -i "<dir>/subtitles_zh.srt" \
   -i "<dir>/subtitles_en.srt" \
-  -map 0:v -map 0:a? -map 1:0 -map 2:0 -map 3:0 \
+  -map 0:v -map 0:a? -map 1:0 -map 2:0 \
   -c:v copy -c:a copy -c:s mov_text \
-  -metadata:s:s:0 language=und -metadata:s:s:0 title="Source + Target" \
-  -metadata:s:s:1 language=und -metadata:s:s:1 title="Target" \
-  -metadata:s:s:2 language=und -metadata:s:s:2 title="Source" \
-  -disposition:s:0 default -disposition:s:1 0 -disposition:s:2 0 \
+  -metadata:s:s:0 language="$TARGET_LANG_CODE" -metadata:s:s:0 title="Target" \
+  -metadata:s:s:1 language="$SOURCE_LANG_CODE" -metadata:s:s:1 title="Source" \
+  -disposition:s:0 default -disposition:s:1 0 \
   "<dir>/video_with_selectable_subtitles.mp4"
 ```
 
 MKV output:
 
 ```bash
+TARGET_LANG_CODE=chi
+SOURCE_LANG_CODE=eng
+
 ffmpeg -y \
   -i "<dir>/video.mp4" \
-  -i "<dir>/subtitles_bilingual.srt" \
   -i "<dir>/subtitles_zh.srt" \
   -i "<dir>/subtitles_en.srt" \
-  -map 0:v -map 0:a? -map 1:0 -map 2:0 -map 3:0 \
+  -map 0:v -map 0:a? -map 1:0 -map 2:0 \
   -c copy \
-  -metadata:s:s:0 language=und -metadata:s:s:0 title="Source + Target" \
-  -metadata:s:s:1 language=und -metadata:s:s:1 title="Target" \
-  -metadata:s:s:2 language=und -metadata:s:s:2 title="Source" \
-  -disposition:s:0 default -disposition:s:1 0 -disposition:s:2 0 \
+  -metadata:s:s:0 language="$TARGET_LANG_CODE" -metadata:s:s:0 title="Target" \
+  -metadata:s:s:1 language="$SOURCE_LANG_CODE" -metadata:s:s:1 title="Source" \
+  -disposition:s:0 default -disposition:s:1 0 \
   "<dir>/video_with_selectable_subtitles.mkv"
 ```
 
@@ -237,9 +246,13 @@ Generated files:
 
 Default track layout:
 
-1. Source + target language, default
-2. Target language only
-3. Source language only
+1. Target language only, default
+2. Source language only, optional
+
+For Chinese target subtitles translated from English, the expected MKV subtitle layout is:
+
+1. `chi` or `zho`, title `Target`, default
+2. `eng`, title `Source`, optional
 
 Verify tracks:
 
