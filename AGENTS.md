@@ -1,0 +1,2 @@
+- Don't modify skills under installation paths, which are updated through `npx skills update --global -y`
+- Change skills in this directory, which are single truth for all installed skills
