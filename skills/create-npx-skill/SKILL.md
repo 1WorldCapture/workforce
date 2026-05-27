@@ -49,12 +49,13 @@ documentation at the repository root.
 
 ## Skill Metadata
 
-Every `SKILL.md` needs YAML frontmatter:
+Every `SKILL.md` needs YAML frontmatter. `name` and `description` are
+mandatory:
 
 ```md
 ---
-name: my-skill
-description: >
+name: my-skill # mandatory
+description: > # mandatory
   Clear trigger description. Say exactly when the agent should use this skill,
   including common user phrases and target workflows.
 ---
